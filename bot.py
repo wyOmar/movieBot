@@ -1,8 +1,9 @@
 import os
+import re
+import asyncio
 import sqlite3
 import requests
 import discord
-from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -11,6 +12,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "348883315626868737"))
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+TARGET_CHANNEL_ID = 1535387050944241818
 
 # 2. Initialize Bot
 intents = discord.Intents.default()
@@ -27,8 +29,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tmdb_id INTEGER UNIQUE NOT NULL,
             title TEXT NOT NULL,
-            tmdb_url TEXT NOT NULL,
             recommender_id INTEGER NOT NULL,
+            message_id INTEGER,
             watched BOOLEAN DEFAULT 0
         )
     """)
@@ -41,371 +43,361 @@ def init_db():
             FOREIGN KEY (movie_id) REFERENCES movies (id) ON DELETE CASCADE
         )
     """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id INTEGER PRIMARY KEY
+        )
+    """)
     conn.commit()
     conn.close()
 
 init_db()
 
 # 4. Helper Functions
-def search_tmdb(title: str):
-    url = "https://api.themoviedb.org/3/search/movie"
-    params = {"api_key": TMDB_API_KEY, "query": title, "include_adult": "false"}
+def fetch_tmdb_by_id(tmdb_id: int):
+    url = f"https://api.themoviedb.org/3/movie/{tmdb_id}"
+    params = {"api_key": TMDB_API_KEY}
     try:
-        response = requests.get(url, params=params)
-        if response.status_code == 200:
-            results = response.json().get("results", [])
-            if results:
-                first_hit = results[0]
-                tmdb_id = first_hit["id"]
-                year = first_hit.get("release_date", "")[:4]
-                formatted_title = f"{first_hit['title']} ({year})" if year else first_hit['title']
-                tmdb_url = f"https://www.themoviedb.org/movie/{tmdb_id}"
-                
-                return {
-                    "tmdb_id": tmdb_id,
-                    "title": formatted_title,
-                    "url": tmdb_url
-                }
+        res = requests.get(url, params=params)
+        if res.status_code == 200:
+            data = res.json()
+            year = data.get("release_date", "")[:4]
+            title = f"{data['title']} ({year})" if year else data['title']
+            return {"tmdb_id": data["id"], "title": title}
     except Exception as e:
         print(f"TMDb Fetch Error: {e}")
     return None
 
-def format_user_mention(guild: discord.Guild, user_id: int) -> str:
-    member = guild.get_member(user_id) if guild else None
-    if member:
-        return member.mention
-    return f"<@{user_id}>"
+def search_tmdb_by_query(query: str):
+    url = "https://api.themoviedb.org/3/search/movie"
+    params = {"api_key": TMDB_API_KEY, "query": query, "include_adult": "false"}
+    try:
+        res = requests.get(url, params=params)
+        if res.status_code == 200:
+            results = res.json().get("results", [])
+            if results:
+                hit = results[0]
+                year = hit.get("release_date", "")[:4]
+                title = f"{hit['title']} ({year})" if year else hit['title']
+                return {"tmdb_id": hit["id"], "title": title}
+    except Exception as e:
+        print(f"TMDb Search Error: {e}")
+    return None
 
-# 5. Dynamic Watchlist View
-class WatchlistSelect(discord.ui.Select):
-    def __init__(self, movies, user_interested_ids, current_page, total_pages):
-        self.movies = movies
-        user_interested_set = set(user_interested_ids)
+def format_movie_display(movie_id: int, tmdb_id: int, title: str, recommender_id: int, interested_ids: list, watched: bool) -> str:
+    sugg_mention = f"<@{recommender_id}>"
+    interested_mentions = " ".join([f"<@{uid}>" for uid in interested_ids]) if interested_ids else "None"
+    tmdb_url = f"https://www.themoviedb.org/movie/{tmdb_id}"
+    
+    details = f"Recommender: {sugg_mention} | Interested: {interested_mentions}"
+    if watched:
+        details = f"~~{details}~~ ✅"
         
-        options = []
-        for m_id, title in movies:
-            is_interested = m_id in user_interested_set
-            options.append(
-                discord.SelectOption(
-                    label=title[:100],
-                    value=str(m_id),
-                    emoji="✅" if is_interested else "❌",
-                    default=is_interested,
-                    description="Toggle watch interest"
-                )
-            )
-            
-        super().__init__(
-            placeholder=f"Select movies to toggle... (Page {current_page + 1}/{total_pages})",
-            min_values=0,
-            max_values=len(options),
-            options=options
+    return f"`{movie_id}` [{title}]({tmdb_url}) | {details}"
+
+def get_movie_details(movie_id: int):
+    conn = sqlite3.connect("movies.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, tmdb_id, title, recommender_id, message_id, watched FROM movies WHERE id = ?", (movie_id,))
+    movie = cursor.fetchone()
+    
+    if not movie:
+        conn.close()
+        return None
+        
+    cursor.execute("SELECT user_id FROM interested WHERE movie_id = ?", (movie_id,))
+    interested_ids = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    
+    return {
+        "id": movie[0],
+        "tmdb_id": movie[1],
+        "title": movie[2],
+        "recommender_id": movie[3],
+        "message_id": movie[4],
+        "watched": bool(movie[5]),
+        "interested_ids": interested_ids
+    }
+
+async def refresh_movie_message(channel: discord.TextChannel, movie_id: int):
+    details = get_movie_details(movie_id)
+    if not details or not details["message_id"]:
+        return
+        
+    try:
+        msg = await channel.fetch_message(details["message_id"])
+        content = format_movie_display(
+            details["id"], details["tmdb_id"], details["title"], details["recommender_id"], details["interested_ids"], details["watched"]
         )
+        await msg.edit(content=content)
+    except discord.NotFound:
+        pass
 
-    async def callback(self, interaction: discord.Interaction):
-        user_id = interaction.user.id
-        selected_ids = {int(val) for val in self.values}
+def toggle_interest(movie_id: int, user_id: int):
+    conn = sqlite3.connect("movies.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM interested WHERE movie_id = ? AND user_id = ?", (movie_id, user_id))
+    if cursor.fetchone():
+        cursor.execute("DELETE FROM interested WHERE movie_id = ? AND user_id = ?", (movie_id, user_id))
+    else:
+        cursor.execute("INSERT INTO interested (movie_id, user_id) VALUES (?, ?)", (movie_id, user_id))
+    conn.commit()
+    conn.close()
 
-        conn = sqlite3.connect("movies.db")
-        cursor = conn.cursor()
+def is_user_banned(user_id: int) -> bool:
+    conn = sqlite3.connect("movies.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
+    banned = cursor.fetchone() is not None
+    conn.close()
+    return banned
 
-        for m_id, _ in self.movies:
-            if m_id in selected_ids:
-                cursor.execute("INSERT OR IGNORE INTO interested (movie_id, user_id) VALUES (?, ?)", (m_id, user_id))
-            else:
-                cursor.execute("DELETE FROM interested WHERE movie_id = ? AND user_id = ?", (m_id, user_id))
+async def send_temp_message(channel: discord.TextChannel, content: str, delay: int = 5):
+    msg = await channel.send(content)
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except discord.NotFound:
+        pass
 
-        conn.commit()
-        conn.close()
-
-        await self.view.update_message(interaction)
-
-class WatchlistView(discord.ui.View):
-    def __init__(self, interaction: discord.Interaction):
-        super().__init__(timeout=180)
-        self.interaction = interaction
-        self.page = 0
-        self.per_page = 10  # Increased to 10 per page
-
-    async def get_page_data(self):
-        conn = sqlite3.connect("movies.db")
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT id, title, recommender_id FROM movies WHERE watched = 0 ORDER BY id ASC")
-        all_movies = cursor.fetchall()
-
-        total_pages = max(1, (len(all_movies) + self.per_page - 1) // self.per_page)
-        
-        start = self.page * self.per_page
-        end = start + self.per_page
-        page_movies = all_movies[start:end]
-
-        embed = discord.Embed(title="🎬 Server Watchlist", color=discord.Color.blue())
-        embed.set_footer(text=f"Page {self.page + 1} of {total_pages}")
-
-        lines = []
-        user_interested_movie_ids = set()
-
-        for m_id, title, rec_id in page_movies:
-            rec_mention = format_user_mention(self.interaction.guild, rec_id)
-
-            cursor.execute("SELECT user_id FROM interested WHERE movie_id = ?", (m_id,))
-            interested_ids = [row[0] for row in cursor.fetchall()]
-            
-            if self.interaction.user.id in interested_ids:
-                user_interested_movie_ids.add(m_id)
-
-            names = [format_user_mention(self.interaction.guild, uid) for uid in interested_ids]
-            interested_str = ", ".join(names) if names else "None"
-
-            # Simplified single/double line layout
-            lines.append(f"**{title}** {rec_mention}\nInterested: {interested_str}\n")
-
-        embed.description = "\n".join(lines) if lines else "No active movies on the list!"
-        conn.close()
-        return embed, page_movies, total_pages, user_interested_movie_ids
-
-    async def build_components(self):
-        self.clear_items()
-        embed, page_movies, total_pages, user_interested = await self.get_page_data()
-
-        if self.page >= total_pages:
-            self.page = max(0, total_pages - 1)
-
-        prev_btn = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, disabled=(self.page == 0))
-        next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, disabled=(self.page >= total_pages - 1))
-
-        async def prev_callback(interaction: discord.Interaction):
-            self.page -= 1
-            await self.update_message(interaction)
-
-        async def next_callback(interaction: discord.Interaction):
-            self.page += 1
-            await self.update_message(interaction)
-
-        prev_btn.callback = prev_callback
-        next_btn.callback = next_callback
-
-        self.add_item(prev_btn)
-        self.add_item(next_btn)
-
-        if page_movies:
-            dropdown_items = [(m[0], m[1]) for m in page_movies]
-            self.add_item(WatchlistSelect(dropdown_items, user_interested, self.page, total_pages))
-
-        return embed
-
-    async def update_message(self, interaction: discord.Interaction):
-        embed = await self.build_components()
-        await interaction.response.edit_message(embed=embed, view=self)
-
-# 6. Multi-Select Batch Movie Removal
-class MultiRemoveSelectView(discord.ui.View):
-    def __init__(self, movies: list):
+# 5. Dynamic Delete Button View
+class QuickDeleteView(discord.ui.View):
+    def __init__(self, movie_id: int, suggester_id: int):
         super().__init__(timeout=60)
-        
-        options = [
-            discord.SelectOption(label=title[:100], value=str(m_id), emoji="🗑️") 
-            for m_id, title in movies[:25]
-        ]
-        
-        select = discord.ui.Select(
-            placeholder="Select one or multiple movies to delete...",
-            min_values=1,
-            max_values=len(options),
-            options=options
-        )
-        select.callback = self.select_callback
-        self.add_item(select)
+        self.movie_id = movie_id
+        self.suggester_id = suggester_id
 
-    async def select_callback(self, interaction: discord.Interaction):
-        selected_ids = [int(val) for val in interaction.data["values"]]
-        
+    @discord.ui.button(label="Delete Suggestion", style=discord.ButtonStyle.danger)
+    async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if is_user_banned(interaction.user.id):
+            await interaction.response.send_message("❌ You are banned from interacting with the bot.", ephemeral=True)
+            return
+
+        if interaction.user.id != self.suggester_id and interaction.user.id != ADMIN_ID:
+            await interaction.response.send_message("❌ Only the suggester or admin can delete this.", ephemeral=True)
+            return
+
         conn = sqlite3.connect("movies.db")
         cursor = conn.cursor()
-
-        cursor.executemany("DELETE FROM movies WHERE id = ?", [(m_id,) for m_id in selected_ids])
+        cursor.execute("DELETE FROM movies WHERE id = ?", (self.movie_id,))
+        cursor.execute("DELETE FROM interested WHERE movie_id = ?", (self.movie_id,))
         conn.commit()
         conn.close()
 
-        await interaction.response.edit_message(
-            content=f"🗑️ Successfully removed **{len(selected_ids)}** movie(s) from the list.", 
-            view=None
-        )
+        await interaction.message.delete()
 
-# 7. Watched Movies Pagination View
-class WatchedListView(discord.ui.View):
-    def __init__(self, interaction: discord.Interaction):
-        super().__init__(timeout=180)
-        self.interaction = interaction
-        self.page = 0
-        self.per_page = 10
-
-    async def get_page_data(self):
-        conn = sqlite3.connect("movies.db")
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT title, recommender_id FROM movies WHERE watched = 1 ORDER BY id DESC")
-        all_movies = cursor.fetchall()
-
-        total_pages = max(1, (len(all_movies) + self.per_page - 1) // self.per_page)
-        
-        start = self.page * self.per_page
-        end = start + self.per_page
-        page_movies = all_movies[start:end]
-
-        embed = discord.Embed(title="🍿 Watched Movies History", color=discord.Color.green())
-        embed.set_footer(text=f"Page {self.page + 1} of {total_pages}")
-
-        lines = []
-        for title, rec_id in page_movies:
-            rec_mention = format_user_mention(self.interaction.guild, rec_id)
-            lines.append(f"✅ **{title}** — {rec_mention}")
-
-        embed.description = "\n".join(lines) if lines else "No watched movies recorded yet."
-        conn.close()
-        return embed, total_pages
-
-    async def build_components(self):
-        self.clear_items()
-        embed, total_pages = await self.get_page_data()
-
-        prev_btn = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, disabled=(self.page == 0))
-        next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, disabled=(self.page >= total_pages - 1))
-
-        async def prev_callback(interaction: discord.Interaction):
-            self.page -= 1
-            await self.update_message(interaction)
-
-        async def next_callback(interaction: discord.Interaction):
-            self.page += 1
-            await self.update_message(interaction)
-
-        prev_btn.callback = prev_callback
-        next_btn.callback = next_callback
-
-        self.add_item(prev_btn)
-        self.add_item(next_btn)
-        return embed
-
-    async def update_message(self, interaction: discord.Interaction):
-        embed = await self.build_components()
-        await interaction.response.edit_message(embed=embed, view=self)
-
-# 8. Commands Setup
+# 6. Bot Events & Message Handlers
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    if payload.channel_id != TARGET_CHANNEL_ID:
+        return
+
+    conn = sqlite3.connect("movies.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM movies WHERE message_id = ?", (payload.message_id,))
+    conn.commit()
+    conn.close()
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or message.channel.id != TARGET_CHANNEL_ID:
+        return
+
+    content = message.content.strip()
+    user_id = message.author.id
+
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s)")
-    except Exception as e:
-        print(f"Sync error: {e}")
+        await message.delete()
+    except discord.HTTPException:
+        pass
 
-@bot.tree.command(name="suggest", description="Suggest a movie to watch (verified via TMDb).")
-async def suggest(interaction: discord.Interaction, title: str):
-    user_id = interaction.user.id
-
-    movie_info = search_tmdb(title)
-    if not movie_info:
-        await interaction.response.send_message(
-            f"❌ Could not find **{title}** on TMDb. Please check your spelling.", 
-            ephemeral=True
-        )
+    # Check if user is banned (ignore everything they send)
+    if is_user_banned(user_id) and user_id != ADMIN_ID:
         return
 
-    tmdb_id = movie_info["tmdb_id"]
-    official_title = movie_info["title"]
-    tmdb_url = movie_info["url"]
-
-    conn = sqlite3.connect("movies.db")
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT COUNT(*) FROM movies WHERE recommender_id = ? AND watched = 0", (user_id,))
-    if cursor.fetchone()[0] >= 15:
-        conn.close()
-        await interaction.response.send_message("❌ You have reached your limit of 15 active movie suggestions.", ephemeral=True)
-        return
-
-    cursor.execute("SELECT title FROM movies WHERE tmdb_id = ?", (tmdb_id,))
-    existing = cursor.fetchone()
-    if existing:
-        conn.close()
-        await interaction.response.send_message(f"❌ **{existing[0]}** is already on the watch list!", ephemeral=True)
-        return
-
-    cursor.execute(
-        "INSERT INTO movies (tmdb_id, title, tmdb_url, recommender_id) VALUES (?, ?, ?, ?)",
-        (tmdb_id, official_title, tmdb_url, user_id)
-    )
-    movie_id = cursor.lastrowid
-    cursor.execute("INSERT INTO interested (movie_id, user_id) VALUES (?, ?)", (movie_id, user_id))
-
-    conn.commit()
-    conn.close()
-
-    await interaction.response.send_message(f"✅ Found & added **[{official_title}](<{tmdb_url}>)** to the watchlist!")
-
-@bot.tree.command(name="list", description="View the active movie watchlist.")
-async def list_movies(interaction: discord.Interaction):
-    view = WatchlistView(interaction)
-    embed = await view.build_components()
-    await interaction.response.send_message(embed=embed, view=view)
-
-@bot.tree.command(name="remove", description="Batch delete movie suggestions via multi-select dropdown.")
-async def remove_movie(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    conn = sqlite3.connect("movies.db")
-    cursor = conn.cursor()
-
+    # --- ADMIN COMMANDS ---
     if user_id == ADMIN_ID:
-        cursor.execute("SELECT id, title FROM movies WHERE watched = 0 ORDER BY id DESC")
+        if content.startswith("!ban "):
+            try:
+                target_user_id = int(content.split()[1])
+                conn = sqlite3.connect("movies.db")
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (target_user_id,))
+                if cursor.fetchone():
+                    cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (target_user_id,))
+                else:
+                    cursor.execute("INSERT INTO banned_users (user_id) VALUES (?)", (target_user_id,))
+                conn.commit()
+                conn.close()
+            except (IndexError, ValueError):
+                pass
+            return
+
+        elif content.startswith("!remove "):
+            try:
+                target_user_id = int(content.split()[1])
+                conn = sqlite3.connect("movies.db")
+                cursor = conn.cursor()
+                
+                # Delete movies they suggested (and clean up Discord messages)
+                cursor.execute("SELECT id, message_id FROM movies WHERE recommender_id = ?", (target_user_id,))
+                suggested_movies = cursor.fetchall()
+                
+                for m_id, msg_id in suggested_movies:
+                    if msg_id:
+                        try:
+                            msg = await message.channel.fetch_message(msg_id)
+                            await msg.delete()
+                        except discord.NotFound:
+                            pass
+                    cursor.execute("DELETE FROM interested WHERE movie_id = ?", (m_id,))
+                    cursor.execute("DELETE FROM movies WHERE id = ?", (m_id,))
+                
+                # Retrieve movies they were ONLY interested in (to update Discord messages)
+                cursor.execute("SELECT movie_id FROM interested WHERE user_id = ?", (target_user_id,))
+                movies_to_update = [row[0] for row in cursor.fetchall()]
+                
+                cursor.execute("DELETE FROM interested WHERE user_id = ?", (target_user_id,))
+                conn.commit()
+                conn.close()
+
+                # Refresh messages to erase them from the interested lists visually
+                for m_id in movies_to_update:
+                    await refresh_movie_message(message.channel, m_id)
+
+            except (IndexError, ValueError):
+                pass
+            return
+
+        elif content.startswith("!watched "):
+            try:
+                m_id = int(content.split()[1])
+                conn = sqlite3.connect("movies.db")
+                cursor = conn.cursor()
+                cursor.execute("UPDATE movies SET watched = NOT watched WHERE id = ?", (m_id,))
+                conn.commit()
+                conn.close()
+                await refresh_movie_message(message.channel, m_id)
+            except (IndexError, ValueError):
+                pass
+            return
+
+        elif content.startswith("!delete "):
+            try:
+                m_id = int(content.split()[1])
+                details = get_movie_details(m_id)
+                if details and details["message_id"]:
+                    try:
+                        msg = await message.channel.fetch_message(details["message_id"])
+                        await msg.delete()
+                    except discord.NotFound:
+                        pass
+                conn = sqlite3.connect("movies.db")
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM movies WHERE id = ?", (m_id,))
+                cursor.execute("DELETE FROM interested WHERE movie_id = ?", (m_id,))
+                conn.commit()
+                conn.close()
+            except (IndexError, ValueError):
+                pass
+            return
+
+        elif content.startswith("!suggest "):
+            try:
+                parts = content.split()
+                m_id = int(parts[1])
+                new_user_id = int(parts[2])
+                conn = sqlite3.connect("movies.db")
+                cursor = conn.cursor()
+                cursor.execute("UPDATE movies SET recommender_id = ? WHERE id = ?", (new_user_id, m_id))
+                conn.commit()
+                conn.close()
+                await refresh_movie_message(message.channel, m_id)
+            except (IndexError, ValueError):
+                pass
+            return
+
+    # --- INDEX SELECTION (Plain digits like 1 or 12) ---
+    if content.isdigit():
+        target_id = int(content)
+        details = get_movie_details(target_id)
+        if details and not details["watched"]:
+            toggle_interest(target_id, user_id)
+            await refresh_movie_message(message.channel, target_id)
+        return
+
+    # --- TMDB URL OR TITLE PROCESSING ---
+    tmdb_info = None
+    url_match = re.search(r"themoviedb\.org/movie/(\d+)", content)
+    
+    if url_match:
+        tmdb_id = int(url_match.group(1))
+        tmdb_info = fetch_tmdb_by_id(tmdb_id)
     else:
-        cursor.execute("SELECT id, title FROM movies WHERE recommender_id = ? AND watched = 0 ORDER BY id DESC", (user_id,))
+        tmdb_info = search_tmdb_by_query(content)
 
-    movies = cursor.fetchall()
-    conn.close()
-
-    if not movies:
-        await interaction.response.send_message("❌ No eligible movies found for you to remove.", ephemeral=True)
+    if not tmdb_info:
         return
 
-    view = MultiRemoveSelectView(movies)
-    await interaction.response.send_message("Select movie(s) to remove:", view=view, ephemeral=True)
-
-@bot.tree.command(name="mark_watched", description="[ADMIN ONLY] Toggle a movie's watched status by freetyping the title.")
-async def mark_watched(interaction: discord.Interaction, title: str):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("❌ Only the admin can mark movies as watched.", ephemeral=True)
-        return
-
+    # Check local DB
     conn = sqlite3.connect("movies.db")
     cursor = conn.cursor()
+    cursor.execute("SELECT id, watched FROM movies WHERE tmdb_id = ?", (tmdb_info["tmdb_id"],))
+    existing = cursor.fetchone()
 
-    cursor.execute("SELECT id, title, watched FROM movies WHERE LOWER(title) LIKE LOWER(?)", (f"%{title.strip()}%",))
-    movie = cursor.fetchone()
-
-    if not movie:
+    if existing:
+        m_id, watched = existing[0], bool(existing[1])
         conn.close()
-        await interaction.response.send_message(f"❌ Movie matching **{title}** not found.", ephemeral=True)
+        if not watched:
+            toggle_interest(m_id, user_id)
+            await refresh_movie_message(message.channel, m_id)
         return
 
-    movie_id, official_title, is_watched = movie
-    new_status = 0 if is_watched else 1
+    # Enforce 15 unwatched limit check
+    cursor.execute("SELECT COUNT(*) FROM movies WHERE recommender_id = ? AND watched = 0", (user_id,))
+    unwatched_count = cursor.fetchone()[0]
+    
+    if unwatched_count >= 15:
+        conn.close()
+        await send_temp_message(message.channel, "You are only allowed to have 15 unwatched suggestions at once you bum!", delay=6)
+        return
 
-    cursor.execute("UPDATE movies SET watched = ? WHERE id = ?", (new_status, movie_id))
+    # Add new movie
+    cursor.execute(
+        "INSERT INTO movies (tmdb_id, title, recommender_id) VALUES (?, ?, ?)",
+        (tmdb_info["tmdb_id"], tmdb_info["title"], user_id)
+    )
+    new_movie_id = cursor.lastrowid
+
+    # Auto-add suggester to interested list
+    cursor.execute("INSERT INTO interested (movie_id, user_id) VALUES (?, ?)", (new_movie_id, user_id))
     conn.commit()
     conn.close()
 
-    if new_status == 1:
-        await interaction.response.send_message(f"🎉 Marked **{official_title}** as watched!")
-    else:
-        await interaction.response.send_message(f"🔄 Restored **{official_title}** back to the active watchlist!")
+    # Send message with 60s red delete button
+    view = QuickDeleteView(new_movie_id, user_id)
+    formatted_msg = format_movie_display(new_movie_id, tmdb_info["tmdb_id"], tmdb_info["title"], user_id, [user_id], False)
+    sent_msg = await message.channel.send(formatted_msg, view=view)
 
-@bot.tree.command(name="watched", description="View the list of movies that have been watched.")
-async def watched(interaction: discord.Interaction):
-    view = WatchedListView(interaction)
-    embed = await view.build_components()
-    await interaction.response.send_message(embed=embed, view=view)
+    # Save message_id
+    conn = sqlite3.connect("movies.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE movies SET message_id = ? WHERE id = ?", (sent_msg.id, new_movie_id))
+    conn.commit()
+    conn.close()
+
+    asyncio.create_task(remove_view_after_timeout(sent_msg, 60))
+
+async def remove_view_after_timeout(msg: discord.Message, timeout: int):
+    await asyncio.sleep(timeout)
+    try:
+        await msg.edit(view=None)
+    except discord.NotFound:
+        pass
 
 bot.run(TOKEN)

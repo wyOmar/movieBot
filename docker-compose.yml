@@ -1,0 +1,9 @@
+services:
+  movie_bot:
+    build: .
+    container_name: movie_bot
+    restart: unless-stopped
+    volumes:
+      - ./movies.db:/app/movies.db
+    environment:
+      - TZ=Europe/London
