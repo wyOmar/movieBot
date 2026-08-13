@@ -20,7 +20,7 @@ intents.message_content = True
 intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Global lock to prevent race conditions during edits
+# Global concurrency lock to prevent race conditions during message edits
 channel_lock = asyncio.Lock()
 
 # 3. Database Setup
@@ -178,7 +178,6 @@ async def toggle_watched_and_swap(channel: discord.TextChannel, target_id: int):
         cursor.execute("SELECT id FROM movies WHERE watched = 1 ORDER BY watched_at DESC, id DESC LIMIT 1")
         old_last_watched = cursor.fetchone()
 
-        # Find the first active movie in message order
         cursor.execute("SELECT id, message_id FROM movies WHERE watched = 0 AND message_id IS NOT NULL ORDER BY message_id ASC")
         unwatched_movies = cursor.fetchall()
 
@@ -189,7 +188,6 @@ async def toggle_watched_and_swap(channel: discord.TextChannel, target_id: int):
         first_unwatched_id, first_unwatched_msg_id = unwatched_movies[0]
 
         if m_id == first_unwatched_id:
-            # Already at the top of active list, no swap needed
             cursor.execute("UPDATE movies SET watched = 1, watched_at = CURRENT_TIMESTAMP WHERE id = ?", (m_id,))
             conn.commit()
             conn.close()
@@ -198,7 +196,6 @@ async def toggle_watched_and_swap(channel: discord.TextChannel, target_id: int):
                 await refresh_movie_message(channel, old_last_watched[0])
             await refresh_movie_message(channel, m_id)
         else:
-            # Swap message slots between target and first unwatched movie
             cursor.execute("UPDATE movies SET message_id = ? WHERE id = ?", (first_unwatched_msg_id, m_id))
             cursor.execute("UPDATE movies SET message_id = ? WHERE id = ?", (target_msg_id, first_unwatched_id))
             cursor.execute("UPDATE movies SET watched = 1, watched_at = CURRENT_TIMESTAMP WHERE id = ?", (m_id,))
@@ -347,17 +344,19 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or message.channel.id != TARGET_CHANNEL_ID:
+    if message.author.bot:
         return
 
     content = message.content.strip()
     user_id = message.author.id
 
+    # --- OWNER !PING COMMAND (Executable from anywhere or DM) ---
     if content == "!ping" and user_id == ADMIN_ID:
-        try:
-            await message.delete()
-        except discord.HTTPException:
-            pass
+        if message.channel.id == TARGET_CHANNEL_ID:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
 
         conn = sqlite3.connect("movies.db")
         cursor = conn.cursor()
@@ -370,11 +369,22 @@ async def on_message(message: discord.Message):
         users = cursor.fetchall()
         conn.close()
 
-        if users:
+        target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not target_channel:
+            try:
+                target_channel = await bot.fetch_channel(TARGET_CHANNEL_ID)
+            except Exception:
+                target_channel = message.channel
+
+        if users and target_channel:
             pings = " ".join([f"<@{row[0]}>" for row in users])
-            await message.channel.send(f"🔔 Movie Night Ping! {pings}")
+            await target_channel.send(f"🔔 Movie Night Ping! {pings}")
         else:
             await send_temp_message(message.channel, "No users with active interest found.", 5)
+        return
+
+    # Ignore non-ping messages outside target movie channel
+    if message.channel.id != TARGET_CHANNEL_ID:
         return
 
     try:
