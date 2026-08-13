@@ -257,12 +257,12 @@ def is_user_banned(user_id: int) -> bool:
     conn.close()
     return banned
 
-async def send_temp_message(channel: discord.TextChannel, content: str, delay: int = 5):
+async def send_temp_message(channel, content: str, delay: int = 5):
     msg = await channel.send(content)
     await asyncio.sleep(delay)
     try:
         await msg.delete()
-    except discord.NotFound:
+    except discord.HTTPException:
         pass
 
 # 5. Dynamic Delete Button View
@@ -350,13 +350,12 @@ async def on_message(message: discord.Message):
     content = message.content.strip()
     user_id = message.author.id
 
-    # --- OWNER !PING COMMAND (Executable from anywhere or DM) ---
+    # --- OWNER !PING COMMAND (Sends pings in whichever channel command was typed) ---
     if content == "!ping" and user_id == ADMIN_ID:
-        if message.channel.id == TARGET_CHANNEL_ID:
-            try:
-                await message.delete()
-            except discord.HTTPException:
-                pass
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
 
         conn = sqlite3.connect("movies.db")
         cursor = conn.cursor()
@@ -369,16 +368,9 @@ async def on_message(message: discord.Message):
         users = cursor.fetchall()
         conn.close()
 
-        target_channel = bot.get_channel(TARGET_CHANNEL_ID)
-        if not target_channel:
-            try:
-                target_channel = await bot.fetch_channel(TARGET_CHANNEL_ID)
-            except Exception:
-                target_channel = message.channel
-
-        if users and target_channel:
+        if users:
             pings = " ".join([f"<@{row[0]}>" for row in users])
-            await target_channel.send(f"🔔 Movie Night Ping! {pings}")
+            await message.channel.send(f"🔔 Movie Night Ping! {pings}")
         else:
             await send_temp_message(message.channel, "No users with active interest found.", 5)
         return
@@ -522,7 +514,7 @@ async def on_message(message: discord.Message):
             conn.close()
             if not watched:
                 toggle_interest(m_id, user_id)
-                await refresh_movie_message(message.channel, m_id)
+                await refresh_movie_message(channel, m_id)
             return
 
         cursor.execute("SELECT COUNT(*) FROM movies WHERE recommender_id = ? AND watched = 0", (user_id,))
