@@ -20,6 +20,9 @@ intents.message_content = True
 intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Global lock to prevent race conditions during edits
+channel_lock = asyncio.Lock()
+
 # 3. Database Setup
 def init_db():
     conn = sqlite3.connect("movies.db")
@@ -37,7 +40,6 @@ def init_db():
         )
     """)
     
-    # Check if watched_at column exists for older database versions
     cursor.execute("PRAGMA table_info(movies)")
     columns = [col[1] for col in cursor.fetchall()]
     if "watched_at" not in columns:
@@ -98,7 +100,6 @@ def format_movie_display(movie_id: int, tmdb_id: int, title: str, recommender_id
     interested_mentions = " ".join([f"<@{uid}>" for uid in interested_ids]) if interested_ids else "None"
     tmdb_url = f"https://www.themoviedb.org/movie/{tmdb_id}"
     
-    # Removed "Recommender:" label
     details = f"{sugg_mention} | Interested: {interested_mentions}"
     if watched:
         details = f"~~{details}~~ ✅"
@@ -159,54 +160,86 @@ async def refresh_movie_message(channel: discord.TextChannel, movie_id: int):
     except discord.NotFound:
         pass
 
-async def reorder_and_sync_channel(channel: discord.TextChannel):
-    """Reorders messages so watched movies are at the top (oldest -> newest watched) followed by unwatched movies."""
+async def toggle_watched_and_swap(channel: discord.TextChannel, target_id: int):
+    """Direct 1-to-1 swap for instantaneous updates without rate limits."""
     conn = sqlite3.connect("movies.db")
     cursor = conn.cursor()
 
-    # Watched movies ordered from oldest watched to most recent
-    cursor.execute("SELECT id FROM movies WHERE watched = 1 ORDER BY watched_at ASC, id ASC")
-    watched_ids = [r[0] for r in cursor.fetchall()]
-
-    # Unwatched movies ordered by ID
-    cursor.execute("SELECT id FROM movies WHERE watched = 0 ORDER BY id ASC")
-    unwatched_ids = [r[0] for r in cursor.fetchall()]
-
-    all_movie_ids = watched_ids + unwatched_ids
-    if not all_movie_ids:
+    cursor.execute("SELECT id, message_id, watched FROM movies WHERE id = ?", (target_id,))
+    target = cursor.fetchone()
+    if not target:
         conn.close()
         return
 
-    # Gather existing message IDs in chronological order
-    cursor.execute("SELECT message_id FROM movies WHERE message_id IS NOT NULL")
-    message_ids = sorted([r[0] for r in cursor.fetchall() if r[0] is not None])
+    m_id, target_msg_id, is_watched = target[0], target[1], bool(target[2])
 
-    # Re-assign message slots
-    for i, m_id in enumerate(all_movie_ids):
-        if i < len(message_ids):
-            cursor.execute("UPDATE movies SET message_id = ? WHERE id = ?", (message_ids[i], m_id))
+    if not is_watched:
+        # --- MARKING AS WATCHED ---
+        cursor.execute("SELECT id FROM movies WHERE watched = 1 ORDER BY watched_at DESC, id DESC LIMIT 1")
+        old_last_watched = cursor.fetchone()
 
-    conn.commit()
-    conn.close()
+        # Find the first active movie in message order
+        cursor.execute("SELECT id, message_id FROM movies WHERE watched = 0 AND message_id IS NOT NULL ORDER BY message_id ASC")
+        unwatched_movies = cursor.fetchall()
 
-    # Refresh message contents in Discord
-    last_watched_id = watched_ids[-1] if watched_ids else None
-    for i, m_id in enumerate(all_movie_ids):
-        if i < len(message_ids):
-            target_msg_id = message_ids[i]
-            details = get_movie_details(m_id)
-            if details:
-                is_last = (m_id == last_watched_id)
-                content = format_movie_display(
-                    details["id"], details["tmdb_id"], details["title"], details["recommender_id"],
-                    details["interested_ids"], details["watched"], is_last_watched=is_last
-                )
-                try:
-                    msg = await channel.fetch_message(target_msg_id)
-                    if msg.content != content:
-                        await msg.edit(content=content)
-                except discord.NotFound:
-                    pass
+        if not unwatched_movies:
+            conn.close()
+            return
+
+        first_unwatched_id, first_unwatched_msg_id = unwatched_movies[0]
+
+        if m_id == first_unwatched_id:
+            # Already at the top of active list, no swap needed
+            cursor.execute("UPDATE movies SET watched = 1, watched_at = CURRENT_TIMESTAMP WHERE id = ?", (m_id,))
+            conn.commit()
+            conn.close()
+
+            if old_last_watched:
+                await refresh_movie_message(channel, old_last_watched[0])
+            await refresh_movie_message(channel, m_id)
+        else:
+            # Swap message slots between target and first unwatched movie
+            cursor.execute("UPDATE movies SET message_id = ? WHERE id = ?", (first_unwatched_msg_id, m_id))
+            cursor.execute("UPDATE movies SET message_id = ? WHERE id = ?", (target_msg_id, first_unwatched_id))
+            cursor.execute("UPDATE movies SET watched = 1, watched_at = CURRENT_TIMESTAMP WHERE id = ?", (m_id,))
+            conn.commit()
+            conn.close()
+
+            if old_last_watched:
+                await refresh_movie_message(channel, old_last_watched[0])
+            await refresh_movie_message(channel, m_id)
+            await refresh_movie_message(channel, first_unwatched_id)
+
+    else:
+        # --- MARKING AS UNWATCHED ---
+        cursor.execute("SELECT id, message_id FROM movies WHERE watched = 1 ORDER BY watched_at DESC, id DESC LIMIT 1")
+        last_watched = cursor.fetchone()
+
+        if not last_watched:
+            conn.close()
+            return
+
+        last_watched_id, last_watched_msg_id = last_watched[0], last_watched[1]
+
+        if m_id == last_watched_id:
+            cursor.execute("UPDATE movies SET watched = 0, watched_at = NULL WHERE id = ?", (m_id,))
+            conn.commit()
+            cursor.execute("SELECT id FROM movies WHERE watched = 1 ORDER BY watched_at DESC, id DESC LIMIT 1")
+            new_last = cursor.fetchone()
+            conn.close()
+
+            await refresh_movie_message(channel, m_id)
+            if new_last:
+                await refresh_movie_message(channel, new_last[0])
+        else:
+            cursor.execute("UPDATE movies SET message_id = ? WHERE id = ?", (last_watched_msg_id, m_id))
+            cursor.execute("UPDATE movies SET message_id = ? WHERE id = ?", (target_msg_id, last_watched_id))
+            cursor.execute("UPDATE movies SET watched = 0, watched_at = NULL WHERE id = ?", (m_id,))
+            conn.commit()
+            conn.close()
+
+            await refresh_movie_message(channel, m_id)
+            await refresh_movie_message(channel, last_watched_id)
 
 def toggle_interest(movie_id: int, user_id: int):
     conn = sqlite3.connect("movies.db")
@@ -270,32 +303,31 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.user_id == bot.user.id or is_user_banned(payload.user_id):
         return
 
-    channel = bot.get_channel(payload.channel_id)
-    if not channel:
+    async with channel_lock:
+        channel = bot.get_channel(payload.channel_id)
+        if not channel:
+            try:
+                channel = await bot.fetch_channel(payload.channel_id)
+            except Exception:
+                return
+
         try:
-            channel = await bot.fetch_channel(payload.channel_id)
+            msg = await channel.fetch_message(payload.message_id)
+            await msg.remove_reaction(payload.emoji, payload.member)
         except Exception:
-            return
+            pass
 
-    # Delete the user's reaction
-    try:
-        msg = await channel.fetch_message(payload.message_id)
-        await msg.remove_reaction(payload.emoji, payload.member)
-    except Exception:
-        pass
+        conn = sqlite3.connect("movies.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, watched FROM movies WHERE message_id = ?", (payload.message_id,))
+        movie = cursor.fetchone()
+        conn.close()
 
-    # Check if message corresponds to an active movie
-    conn = sqlite3.connect("movies.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, watched FROM movies WHERE message_id = ?", (payload.message_id,))
-    movie = cursor.fetchone()
-    conn.close()
-
-    if movie:
-        m_id, watched = movie[0], bool(movie[1])
-        if not watched:
-            toggle_interest(m_id, payload.user_id)
-            await refresh_movie_message(channel, m_id)
+        if movie:
+            m_id, watched = movie[0], bool(movie[1])
+            if not watched:
+                toggle_interest(m_id, payload.user_id)
+                await refresh_movie_message(channel, m_id)
 
 # 7. Bot Events & Message Handlers
 @bot.event
@@ -321,7 +353,6 @@ async def on_message(message: discord.Message):
     content = message.content.strip()
     user_id = message.author.id
 
-    # Owner !ping command handling
     if content == "!ping" and user_id == ADMIN_ID:
         try:
             await message.delete()
@@ -354,182 +385,165 @@ async def on_message(message: discord.Message):
     if is_user_banned(user_id) and user_id != ADMIN_ID:
         return
 
-    # --- ADMIN COMMANDS ---
-    if user_id == ADMIN_ID:
-        if content.startswith("!ban "):
-            try:
-                target_user_id = int(content.split()[1])
-                conn = sqlite3.connect("movies.db")
-                cursor = conn.cursor()
-                cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (target_user_id,))
-                if cursor.fetchone():
-                    cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (target_user_id,))
-                else:
-                    cursor.execute("INSERT INTO banned_users (user_id) VALUES (?)", (target_user_id,))
-                conn.commit()
-                conn.close()
-            except (IndexError, ValueError):
-                pass
-            return
+    async with channel_lock:
+        # --- ADMIN COMMANDS ---
+        if user_id == ADMIN_ID:
+            if content.startswith("!ban "):
+                try:
+                    target_user_id = int(content.split()[1])
+                    conn = sqlite3.connect("movies.db")
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (target_user_id,))
+                    if cursor.fetchone():
+                        cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (target_user_id,))
+                    else:
+                        cursor.execute("INSERT INTO banned_users (user_id) VALUES (?)", (target_user_id,))
+                    conn.commit()
+                    conn.close()
+                except (IndexError, ValueError):
+                    pass
+                return
 
-        elif content.startswith("!remove "):
-            try:
-                target_user_id = int(content.split()[1])
-                conn = sqlite3.connect("movies.db")
-                cursor = conn.cursor()
-                
-                cursor.execute("SELECT id, message_id FROM movies WHERE recommender_id = ?", (target_user_id,))
-                suggested_movies = cursor.fetchall()
-                
-                for m_id, msg_id in suggested_movies:
-                    if msg_id:
+            elif content.startswith("!remove "):
+                try:
+                    target_user_id = int(content.split()[1])
+                    conn = sqlite3.connect("movies.db")
+                    cursor = conn.cursor()
+                    
+                    cursor.execute("SELECT id, message_id FROM movies WHERE recommender_id = ?", (target_user_id,))
+                    suggested_movies = cursor.fetchall()
+                    
+                    for m_id, msg_id in suggested_movies:
+                        if msg_id:
+                            try:
+                                msg = await message.channel.fetch_message(msg_id)
+                                await msg.delete()
+                            except discord.NotFound:
+                                pass
+                        cursor.execute("DELETE FROM interested WHERE movie_id = ?", (m_id,))
+                        cursor.execute("DELETE FROM movies WHERE id = ?", (m_id,))
+                    
+                    cursor.execute("SELECT movie_id FROM interested WHERE user_id = ?", (target_user_id,))
+                    movies_to_update = [row[0] for row in cursor.fetchall()]
+                    
+                    cursor.execute("DELETE FROM interested WHERE user_id = ?", (target_user_id,))
+                    conn.commit()
+                    conn.close()
+
+                    for m_id in movies_to_update:
+                        await refresh_movie_message(message.channel, m_id)
+
+                except (IndexError, ValueError):
+                    pass
+                return
+
+            elif content.startswith("!watched "):
+                try:
+                    m_id = int(content.split()[1])
+                    await toggle_watched_and_swap(message.channel, m_id)
+                except (IndexError, ValueError):
+                    pass
+                return
+
+            elif content.startswith("!delete "):
+                try:
+                    m_id = int(content.split()[1])
+                    details = get_movie_details(m_id)
+                    if details and details["message_id"]:
                         try:
-                            msg = await message.channel.fetch_message(msg_id)
+                            msg = await message.channel.fetch_message(details["message_id"])
                             await msg.delete()
                         except discord.NotFound:
                             pass
-                    cursor.execute("DELETE FROM interested WHERE movie_id = ?", (m_id,))
+                    conn = sqlite3.connect("movies.db")
+                    cursor = conn.cursor()
                     cursor.execute("DELETE FROM movies WHERE id = ?", (m_id,))
-                
-                cursor.execute("SELECT movie_id FROM interested WHERE user_id = ?", (target_user_id,))
-                movies_to_update = [row[0] for row in cursor.fetchall()]
-                
-                cursor.execute("DELETE FROM interested WHERE user_id = ?", (target_user_id,))
-                conn.commit()
-                conn.close()
-
-                for m_id in movies_to_update:
-                    await refresh_movie_message(message.channel, m_id)
-
-            except (IndexError, ValueError):
-                pass
-            return
-
-        elif content.startswith("!watched "):
-            try:
-                m_id = int(content.split()[1])
-                conn = sqlite3.connect("movies.db")
-                cursor = conn.cursor()
-                cursor.execute("SELECT watched FROM movies WHERE id = ?", (m_id,))
-                row = cursor.fetchone()
-                if row:
-                    new_watched = not bool(row[0])
-                    if new_watched:
-                        cursor.execute("UPDATE movies SET watched = 1, watched_at = CURRENT_TIMESTAMP WHERE id = ?", (m_id,))
-                    else:
-                        cursor.execute("UPDATE movies SET watched = 0, watched_at = NULL WHERE id = ?", (m_id,))
+                    cursor.execute("DELETE FROM interested WHERE movie_id = ?", (m_id,))
                     conn.commit()
-                conn.close()
-                await reorder_and_sync_channel(message.channel)
-            except (IndexError, ValueError):
-                pass
+                    conn.close()
+                except (IndexError, ValueError):
+                    pass
+                return
+
+            elif content.startswith("!suggest "):
+                try:
+                    parts = content.split()
+                    m_id = int(parts[1])
+                    new_user_id = int(parts[2])
+                    conn = sqlite3.connect("movies.db")
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE movies SET recommender_id = ? WHERE id = ?", (new_user_id, m_id))
+                    conn.commit()
+                    conn.close()
+                    await refresh_movie_message(message.channel, m_id)
+                except (IndexError, ValueError):
+                    pass
+                return
+
+        # --- INDEX SELECTION ---
+        if content.isdigit():
+            target_id = int(content)
+            details = get_movie_details(target_id)
+            if details and not details["watched"]:
+                toggle_interest(target_id, user_id)
+                await refresh_movie_message(message.channel, target_id)
             return
 
-        elif content.startswith("!delete "):
-            try:
-                m_id = int(content.split()[1])
-                details = get_movie_details(m_id)
-                if details and details["message_id"]:
-                    try:
-                        msg = await message.channel.fetch_message(details["message_id"])
-                        await msg.delete()
-                    except discord.NotFound:
-                        pass
-                conn = sqlite3.connect("movies.db")
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM movies WHERE id = ?", (m_id,))
-                cursor.execute("DELETE FROM interested WHERE movie_id = ?", (m_id,))
-                conn.commit()
-                conn.close()
-            except (IndexError, ValueError):
-                pass
+        # --- TMDB URL OR TITLE PROCESSING ---
+        tmdb_info = None
+        url_match = re.search(r"themoviedb\.org/movie/(\d+)", content)
+        
+        if url_match:
+            tmdb_id = int(url_match.group(1))
+            tmdb_info = fetch_tmdb_by_id(tmdb_id)
+        else:
+            tmdb_info = search_tmdb_by_query(content)
+
+        if not tmdb_info:
             return
 
-        elif content.startswith("!suggest "):
-            try:
-                parts = content.split()
-                m_id = int(parts[1])
-                new_user_id = int(parts[2])
-                conn = sqlite3.connect("movies.db")
-                cursor = conn.cursor()
-                cursor.execute("UPDATE movies SET recommender_id = ? WHERE id = ?", (new_user_id, m_id))
-                conn.commit()
-                conn.close()
+        conn = sqlite3.connect("movies.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, watched FROM movies WHERE tmdb_id = ?", (tmdb_info["tmdb_id"],))
+        existing = cursor.fetchone()
+
+        if existing:
+            m_id, watched = existing[0], bool(existing[1])
+            conn.close()
+            if not watched:
+                toggle_interest(m_id, user_id)
                 await refresh_movie_message(message.channel, m_id)
-            except (IndexError, ValueError):
-                pass
             return
 
-    # --- INDEX SELECTION ---
-    if content.isdigit():
-        target_id = int(content)
-        details = get_movie_details(target_id)
-        if details and not details["watched"]:
-            toggle_interest(target_id, user_id)
-            await refresh_movie_message(message.channel, target_id)
-        return
+        cursor.execute("SELECT COUNT(*) FROM movies WHERE recommender_id = ? AND watched = 0", (user_id,))
+        unwatched_count = cursor.fetchone()[0]
+        
+        if unwatched_count >= 15:
+            conn.close()
+            await send_temp_message(message.channel, "You are only allowed to have 15 unwatched suggestions at once you bum!", delay=6)
+            return
 
-    # --- TMDB URL OR TITLE PROCESSING ---
-    tmdb_info = None
-    url_match = re.search(r"themoviedb\.org/movie/(\d+)", content)
-    
-    if url_match:
-        tmdb_id = int(url_match.group(1))
-        tmdb_info = fetch_tmdb_by_id(tmdb_id)
-    else:
-        tmdb_info = search_tmdb_by_query(content)
+        cursor.execute(
+            "INSERT INTO movies (tmdb_id, title, recommender_id) VALUES (?, ?, ?)",
+            (tmdb_info["tmdb_id"], tmdb_info["title"], user_id)
+        )
+        new_movie_id = cursor.lastrowid
 
-    if not tmdb_info:
-        return
-
-    # Check local DB
-    conn = sqlite3.connect("movies.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, watched FROM movies WHERE tmdb_id = ?", (tmdb_info["tmdb_id"],))
-    existing = cursor.fetchone()
-
-    if existing:
-        m_id, watched = existing[0], bool(existing[1])
+        cursor.execute("INSERT INTO interested (movie_id, user_id) VALUES (?, ?)", (new_movie_id, user_id))
+        conn.commit()
         conn.close()
-        if not watched:
-            toggle_interest(m_id, user_id)
-            await refresh_movie_message(message.channel, m_id)
-        return
 
-    # Enforce 15 unwatched limit check
-    cursor.execute("SELECT COUNT(*) FROM movies WHERE recommender_id = ? AND watched = 0", (user_id,))
-    unwatched_count = cursor.fetchone()[0]
-    
-    if unwatched_count >= 15:
+        view = QuickDeleteView(new_movie_id, user_id)
+        formatted_msg = format_movie_display(new_movie_id, tmdb_info["tmdb_id"], tmdb_info["title"], user_id, [user_id], False)
+        sent_msg = await message.channel.send(formatted_msg, view=view)
+
+        conn = sqlite3.connect("movies.db")
+        cursor = conn.cursor()
+        cursor.execute("UPDATE movies SET message_id = ? WHERE id = ?", (sent_msg.id, new_movie_id))
+        conn.commit()
         conn.close()
-        await send_temp_message(message.channel, "You are only allowed to have 15 unwatched suggestions at once you bum!", delay=6)
-        return
 
-    # Add new movie
-    cursor.execute(
-        "INSERT INTO movies (tmdb_id, title, recommender_id) VALUES (?, ?, ?)",
-        (tmdb_info["tmdb_id"], tmdb_info["title"], user_id)
-    )
-    new_movie_id = cursor.lastrowid
-
-    # Auto-add suggester to interested list
-    cursor.execute("INSERT INTO interested (movie_id, user_id) VALUES (?, ?)", (new_movie_id, user_id))
-    conn.commit()
-    conn.close()
-
-    # Send message with 60s red delete button
-    view = QuickDeleteView(new_movie_id, user_id)
-    formatted_msg = format_movie_display(new_movie_id, tmdb_info["tmdb_id"], tmdb_info["title"], user_id, [user_id], False)
-    sent_msg = await message.channel.send(formatted_msg, view=view)
-
-    # Save message_id
-    conn = sqlite3.connect("movies.db")
-    cursor = conn.cursor()
-    cursor.execute("UPDATE movies SET message_id = ? WHERE id = ?", (sent_msg.id, new_movie_id))
-    conn.commit()
-    conn.close()
-
-    asyncio.create_task(remove_view_after_timeout(sent_msg, 60))
+        asyncio.create_task(remove_view_after_timeout(sent_msg, 60))
 
 async def remove_view_after_timeout(msg: discord.Message, timeout: int):
     await asyncio.sleep(timeout)
