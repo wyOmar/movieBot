@@ -5,6 +5,7 @@ import sqlite3
 import requests
 import discord
 from discord.ext import commands
+from discord import app_commands
 from dotenv import load_dotenv
 
 # 1. Load Environment Variables
@@ -64,7 +65,33 @@ def init_db():
 
 init_db()
 
-# 4. Helper Functions
+# 4. Helper Functions & Embed Builder
+def build_info_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="The Movie List",
+        color=0xE50914
+    )
+    embed.add_field(
+        name="How to Use the Bot",
+        value=(
+            f"**Suggest a film:** Post the movie title or a TMDb link directly in <#{TARGET_CHANNEL_ID}>.\n"
+            "**Mark interest:** React with an emoji to the movie's message, type its ID number, or re-type the title."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="The Rules",
+        value=(
+            f"**Suggesting:** Anyone can add films to the list in <#{TARGET_CHANNEL_ID}>.\n"
+            "**Interested:** If you mark yourself as interested, we do our best to only watch it when everyone is here. :lying_face: \n"
+            "**Movie Time:** We aim to start at 20:00 UTC every bloody day (I don't care if you're from Kuwait!)\n"
+            "**The Pick:** Movie decision is SAME DAY and starts 1 hour before movie time.\n"
+            "**Get Ban:** If we sit through your pick and 50%+ of the viewers agrees it was doodoo, you get banned from suggesting for 3 movies. Don't recommend idiot movies."
+        ),
+        inline=False
+    )
+    return embed
+
 def fetch_tmdb_by_id(tmdb_id: int):
     url = f"https://api.themoviedb.org/3/movie/{tmdb_id}"
     params = {"api_key": TMDB_API_KEY}
@@ -174,7 +201,6 @@ async def toggle_watched_and_swap(channel: discord.TextChannel, target_id: int):
     m_id, target_msg_id, is_watched = target[0], target[1], bool(target[2])
 
     if not is_watched:
-        # --- MARKING AS WATCHED ---
         cursor.execute("SELECT id FROM movies WHERE watched = 1 ORDER BY watched_at DESC, id DESC LIMIT 1")
         old_last_watched = cursor.fetchone()
 
@@ -208,7 +234,6 @@ async def toggle_watched_and_swap(channel: discord.TextChannel, target_id: int):
             await refresh_movie_message(channel, first_unwatched_id)
 
     else:
-        # --- MARKING AS UNWATCHED ---
         cursor.execute("SELECT id, message_id FROM movies WHERE watched = 1 ORDER BY watched_at DESC, id DESC LIMIT 1")
         last_watched = cursor.fetchone()
 
@@ -326,9 +351,22 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 toggle_interest(m_id, payload.user_id)
                 await refresh_movie_message(channel, m_id)
 
-# 7. Bot Events & Message Handlers
+# 7. Slash Command (/info)
+@bot.tree.command(name="info", description="View the movie night rules and bot usage guide")
+async def info_slash(interaction: discord.Interaction):
+    if interaction.channel_id == TARGET_CHANNEL_ID:
+        await interaction.response.send_message("❌ Don't clutter the movie list! Use this command in another channel.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=build_info_embed())
+
+# 8. Bot Events & Message Handlers
 @bot.event
 async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} global application command(s).")
+    except Exception as e:
+        print(f"Failed to sync slash commands: {e}")
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 @bot.event
@@ -350,7 +388,18 @@ async def on_message(message: discord.Message):
     content = message.content.strip()
     user_id = message.author.id
 
-    # --- OWNER !PING COMMAND (Sends pings in whichever channel command was typed) ---
+    # --- PREFIX !INFO COMMAND ---
+    if content == "!info":
+        if message.channel.id == TARGET_CHANNEL_ID:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+            return
+        await message.channel.send(embed=build_info_embed())
+        return
+
+    # --- OWNER !PING COMMAND ---
     if content == "!ping" and user_id == ADMIN_ID:
         try:
             await message.delete()
@@ -375,7 +424,7 @@ async def on_message(message: discord.Message):
             await send_temp_message(message.channel, "No users with active interest found.", 5)
         return
 
-    # Ignore non-ping messages outside target movie channel
+    # Ignore non-whitelisted messages outside the target movie channel
     if message.channel.id != TARGET_CHANNEL_ID:
         return
 
